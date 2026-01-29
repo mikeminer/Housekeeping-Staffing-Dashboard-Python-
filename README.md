@@ -24,7 +24,6 @@ Questo strumento nasce per **trasformare i dati di occupazione in numeri oggetti
 * giustificare le scelte operative con dati misurabili
 * ridurre tensioni organizzative basate su valutazioni soggettive
 
-In sintesi: **meno opinioni, più controllo**.
 
 ---
 
