@@ -1,16 +1,20 @@
 """
-Housekeeping Staffing Dashboard (Tkinter) - SINGLE FILE (UI IMPROVED)
+Housekeeping Staffing Dashboard (Tkinter) - SINGLE FILE
 
-Updates:
-- Narrower table columns (more compact layout)
-- Info popup for EACH parameter (Stayover, Departure, Arrival, Turno, Efficienza)
-- Settings persist in config.json (auto-save on exit + manual save button)
+Aggiornamenti richiesti:
+- Colonna ore/minuti nascosta dalla tabella e dal PDF.
+- Parametri e impostazioni spostati in una tab chiamata "Tarature".
+- Generazione PDF con timestamp data/ora e nome del receptionist.
+
+Dipendenza per PDF:
+    pip install reportlab
 
 How to use:
-1) Run: python housekeeping_dashboard_UI_PLUS.py
-2) Click "Carica XML", pick your XML
-3) Set parameters (use the (i) buttons for explanations)
-4) Click "Calcola"
+1) Run: python housekeeping_dashboard_UI_PLUS_PDF.py
+2) Vai in "Tarature" e imposta hotel, receptionist e parametri
+3) Vai in "Report", clicca "Carica XML"
+4) Clicca "Calcola"
+5) Clicca "Genera PDF"
 """
 
 from __future__ import annotations
@@ -19,9 +23,10 @@ import json
 import math
 import os
 import tkinter as tk
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime
 from tkinter import ttk, filedialog, messagebox
+from xml.sax.saxutils import escape
 import xml.etree.ElementTree as ET
 
 CONFIG_FILENAME = "config.json"
@@ -31,6 +36,7 @@ CONFIG_FILENAME = "config.json"
 @dataclass
 class Settings:
     hotel_name: str = "My Hotel"
+    receptionist_name: str = ""
     minutes_stayover: int = 20
     minutes_departure: int = 40
     minutes_arrival: int = 10
@@ -39,6 +45,7 @@ class Settings:
 
     def clamp(self):
         self.hotel_name = (self.hotel_name or "My Hotel").strip()
+        self.receptionist_name = (self.receptionist_name or "").strip()
         self.minutes_stayover = max(0, int(self.minutes_stayover))
         self.minutes_departure = max(0, int(self.minutes_departure))
         self.minutes_arrival = max(0, int(self.minutes_arrival))
@@ -57,9 +64,14 @@ def load_settings():
         return Settings()
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return Settings(**json.load(f)).clamp()
+            data = json.load(f)
+
+        # Compatibile anche con vecchi config.json senza receptionist_name
+        allowed = {field.name for field in fields(Settings)}
+        clean = {k: v for k, v in data.items() if k in allowed}
+        return Settings(**clean).clamp()
     except Exception:
-        # Silent fallback (no popup on startup)
+        # Silent fallback: non blocca l'app se config.json e' danneggiato
         return Settings()
 
 
@@ -69,9 +81,11 @@ def save_settings(settings: Settings):
         json.dump(asdict(settings.clamp()), f, indent=2, ensure_ascii=False)
 
 
-# ---------------- XML ----------------
+# ---------------- XML / CALCOLO ----------------
 def parse_int(v, d=0):
     try:
+        if v is None:
+            return d
         return int(str(v).strip())
     except Exception:
         return d
@@ -85,6 +99,7 @@ def extract_rows(xml_path):
     tree = ET.parse(xml_path)
     root = tree.getroot()
     rows = []
+
     for n in root.findall(".//G_CONSIDERED_DATE"):
         date = n.findtext("C_DATE")
         if not date:
@@ -99,94 +114,102 @@ def extract_rows(xml_path):
         rows.append({
             "date": date.strip(),
             "day": (n.findtext("DAY_DESCRIPTION", "") or "").strip(),
+            "rooms_morning": rooms_morning,
             "arrivals": arrivals,
             "departures": departures,
             "stayover": stayover,
-            "date_obj": parse_date(date)
+            "date_obj": parse_date(date),
         })
 
     return sorted(rows, key=lambda r: r["date_obj"])
 
 
 def compute(row, s: Settings):
+    """
+    Restituisce:
+    - workload_minutes: minuti lavoro totali, usati internamente
+    - staff: numero cameriere necessarie, visibile nel report
+
+    La colonna workload/ore/minuti viene tenuta nascosta nella UI e nel PDF.
+    """
     workload = (
         row["stayover"] * s.minutes_stayover +
         row["departures"] * s.minutes_departure +
         row["arrivals"] * s.minutes_arrival
     )
-    eff_minutes = s.shift_minutes * (s.efficiency_percent / 100)
-    staff = math.ceil(workload / eff_minutes) if workload > 0 else 0
+    effective_minutes = s.shift_minutes * (s.efficiency_percent / 100)
+
+    staff = math.ceil(workload / effective_minutes) if workload > 0 and effective_minutes > 0 else 0
     staff = max(staff, 1) if workload > 0 else 0
+
     return int(workload), int(staff)
 
 
 # ---------------- INFO TEXTS ----------------
 INFO_TEXT = {
     "stayover": (
-        "1️⃣ Minuti Stayover\n"
-        "👉 Camera occupata che resta in house\n\n"
+        "Minuti Stayover\n"
+        "Camera occupata che resta in house.\n\n"
         "Pulizia leggera:\n"
-        "• rifacimento letto\n"
-        "• bagno rapido\n"
-        "• riordino\n"
-        "• cambio asciugamani (a volte)\n\n"
-        "📌 Valore tipico:\n"
-        "• 15–25 minuti\n"
-        "• Hotel 4★ ben organizzato: 20 min (ottimo default)"
+        "- rifacimento letto\n"
+        "- bagno rapido\n"
+        "- riordino\n"
+        "- cambio asciugamani, se previsto\n\n"
+        "Valore tipico:\n"
+        "- 15-25 minuti\n"
+        "- Hotel 4 stelle ben organizzato: 20 min"
     ),
     "departure": (
-        "2️⃣ Minuti Departure (Checkout)\n"
-        "👉 Camera in partenza\n\n"
+        "Minuti Departure / Checkout\n"
+        "Camera in partenza.\n\n"
         "Pulizia completa:\n"
-        "• bagno profondo\n"
-        "• cambio completo biancheria\n"
-        "• controllo minibar\n"
-        "• aspirazione / pavimenti\n"
-        "• controlli finali\n\n"
-        "📌 Valore tipico:\n"
-        "• 35–50 minuti\n"
-        "• 4★ standard: 40 min\n"
-        "• Suite/camere grandi: 50–60 min"
+        "- bagno profondo\n"
+        "- cambio completo biancheria\n"
+        "- controllo minibar\n"
+        "- aspirazione / pavimenti\n"
+        "- controlli finali\n\n"
+        "Valore tipico:\n"
+        "- 35-50 minuti\n"
+        "- 4 stelle standard: 40 min\n"
+        "- Suite/camere grandi: 50-60 min"
     ),
     "arrival": (
-        "3️⃣ Minuti Arrival\n"
-        "👉 Extra legato all’arrivo\n\n"
-        "Non è una pulizia completa, ma:\n"
-        "• rifiniture\n"
-        "• controlli qualità\n"
-        "• richieste speciali\n"
-        "• preparazione VIP\n\n"
-        "📌 Valore tipico:\n"
-        "• 5–15 minuti\n"
-        "• Default sensato: 10 min\n\n"
-        "👉 Se non fate extra sugli arrivi: puoi mettere 0."
+        "Minuti Arrival\n"
+        "Extra legato all'arrivo.\n\n"
+        "Non e' una pulizia completa, ma include:\n"
+        "- rifiniture\n"
+        "- controlli qualita'\n"
+        "- richieste speciali\n"
+        "- preparazione VIP\n\n"
+        "Valore tipico:\n"
+        "- 5-15 minuti\n"
+        "- Default: 10 min\n\n"
+        "Se non fate extra sugli arrivi, puoi mettere 0."
     ),
     "shift": (
-        "4️⃣ Minuti Turno\n"
-        "👉 Tempo reale lavorabile da una cameriera\n\n"
-        "NON è l’orario teorico (8 ore), ma quello effettivo:\n"
+        "Minuti turno reali\n"
+        "Tempo reale lavorabile da una cameriera.\n\n"
+        "Non e' l'orario teorico, ma quello effettivo.\n"
         "Esempio:\n"
-        "• Turno 8 ore = 480 min\n"
-        "• Pause/briefing/spostamenti/imprevisti → −60 min\n\n"
-        "📌 Valore realistico:\n"
-        "• 420 minuti (7 ore reali)\n"
-        "• Hotel molto tirati: 390–400\n\n"
-        "Questo valore è strategico: cambia subito le cameriere necessarie."
+        "- Turno 8 ore = 480 min\n"
+        "- pause/briefing/spostamenti/imprevisti = -60 min\n"
+        "- minuti reali = 420\n\n"
+        "Valore realistico:\n"
+        "- 420 minuti, cioe' 7 ore reali\n"
+        "- Hotel molto tirati: 390-400"
     ),
     "eff": (
-        "⚙️ Cos’è l’Efficienza (%)\n\n"
-        "Serve a stimare quanto del tempo teorico diventa lavoro utile:\n\n"
+        "Efficienza percentuale\n\n"
+        "Serve a stimare quanto del tempo teorico diventa lavoro utile.\n\n"
         "Esempi:\n"
-        "• 100% → giornata perfetta (teorico)\n"
-        "• 90% → hotel ben organizzato\n"
-        "• 80–85% → realtà molto comune\n"
-        "• 70% → caos / staff nuovo / camere lontane\n\n"
+        "- 100% = giornata perfetta teorica\n"
+        "- 90% = hotel ben organizzato\n"
+        "- 80-85% = realta' molto comune\n"
+        "- 70% = caos / staff nuovo / camere lontane\n\n"
         "Nel calcolo:\n"
-        "tempo_effettivo = minuti_turno × (efficienza / 100)\n\n"
+        "tempo_effettivo = minuti_turno x efficienza / 100\n\n"
         "Esempio:\n"
-        "• 420 × 80% = 336 min reali\n"
-        "• 420 × 90% = 378 min reali\n\n"
-        "👉 Cambia direttamente il numero di cameriere consigliate."
+        "420 x 85% = 357 min reali"
     ),
 }
 
@@ -196,12 +219,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Housekeeping Dashboard")
-        self.geometry("1020x620")
-        self.minsize(920, 540)
+        self.geometry("1050x640")
+        self.minsize(950, 560)
 
         self.settings = load_settings()
 
         self.var_hotel = tk.StringVar(value=self.settings.hotel_name)
+        self.var_receptionist = tk.StringVar(value=self.settings.receptionist_name)
         self.var_stay = tk.IntVar(value=self.settings.minutes_stayover)
         self.var_dep = tk.IntVar(value=self.settings.minutes_departure)
         self.var_arr = tk.IntVar(value=self.settings.minutes_arrival)
@@ -209,94 +233,137 @@ class App(tk.Tk):
         self.var_eff = tk.IntVar(value=self.settings.efficiency_percent)
 
         self.xml_path = None
-        self.rows = []
+        self.rows = []  # lista di tuple: (row_dict, workload_minutes, staff)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build_ui()
 
+    # ---------- UI ----------
     def build_ui(self):
-        top = ttk.Frame(self, padding=10)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.tab_report = ttk.Frame(self.notebook, padding=10)
+        self.tab_tarature = ttk.Frame(self.notebook, padding=10)
+
+        self.notebook.add(self.tab_report, text="Report")
+        self.notebook.add(self.tab_tarature, text="Tarature")
+
+        self.build_report_tab(self.tab_report)
+        self.build_tarature_tab(self.tab_tarature)
+
+    def build_report_tab(self, parent):
+        top = ttk.Frame(parent)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="Hotel:", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-        ttk.Entry(top, textvariable=self.var_hotel, width=28).pack(side=tk.LEFT, padx=6)
-        ttk.Button(top, text="Salva impostazioni", command=self.save).pack(side=tk.LEFT)
+        ttk.Button(top, text="Carica XML", command=self.load_xml).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(top, text="Calcola", command=self.calculate).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Genera PDF", command=self.generate_pdf).pack(side=tk.LEFT, padx=6)
 
-        body = ttk.Frame(self, padding=10)
-        body.pack(fill=tk.BOTH, expand=True)
+        self.lbl_xml = ttk.Label(top, text="Nessun file selezionato", foreground="gray")
+        self.lbl_xml.pack(side=tk.LEFT, padx=12)
 
-        left = ttk.LabelFrame(body, text="Parametri", padding=10)
-        left.pack(side=tk.LEFT, fill=tk.Y)
+        self.lbl_summary = ttk.Label(parent, text="", foreground="gray")
+        self.lbl_summary.pack(fill=tk.X, pady=(10, 6))
 
-        self.param_row(left, "Stayover (min)", self.var_stay, "stayover")
-        self.param_row(left, "Departure (min)", self.var_dep, "departure")
-        self.param_row(left, "Arrival (min)", self.var_arr, "arrival")
-        self.param_row(left, "Turno reali (min)", self.var_shift, "shift")
-        self.param_row(left, "Efficienza (%)", self.var_eff, "eff")
+        right = ttk.LabelFrame(parent, text="Risultati", padding=10)
+        right.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-
-        ttk.Button(left, text="Carica XML", command=self.load_xml).pack(fill=tk.X, pady=4)
-        ttk.Button(left, text="Calcola", command=self.calculate).pack(fill=tk.X, pady=4)
-
-        self.lbl_xml = ttk.Label(left, text="Nessun file selezionato", wraplength=240, foreground="gray")
-        self.lbl_xml.pack(fill=tk.X, pady=(8, 0))
-
-        right = ttk.LabelFrame(body, text="Risultati (colonne compatte)", padding=10)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
-
-        cols = ("date", "day", "arr", "dep", "stay", "work", "staff")
+        # Colonna ore/minuti nascosta: workload resta calcolato internamente ma non viene mostrato.
+        cols = ("date", "day", "arr", "dep", "stay", "staff")
         self.tree = ttk.Treeview(right, columns=cols, show="headings", height=18)
-        self.tree.pack(fill=tk.BOTH, expand=True)
+
+        yscroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=yscroll.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         heads = {
             "date": "Data",
             "day": "Giorno",
-            "arr": "Arr",
-            "dep": "Dep",
-            "stay": "Stay",
-            "work": "Min",
-            "staff": "HK",
+            "arr": "Arrivi",
+            "dep": "Partenze",
+            "stay": "Stayover",
+            "staff": "Cameriere",
         }
 
-        # Narrower widths
         widths = {
-            "date": 78,
-            "day": 110,
-            "arr": 48,
-            "dep": 48,
-            "stay": 55,
-            "work": 60,
-            "staff": 55,
+            "date": 90,
+            "day": 130,
+            "arr": 75,
+            "dep": 85,
+            "stay": 85,
+            "staff": 95,
         }
 
         for c in cols:
             self.tree.heading(c, text=heads[c])
-            self.tree.column(c, anchor=tk.CENTER, width=widths[c], stretch=False)
+            self.tree.column(c, anchor=tk.CENTER, width=widths[c], stretch=True)
 
-        # Optional: allow horizontal scroll if window is tight
-        xscroll = ttk.Scrollbar(right, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(xscrollcommand=xscroll.set)
-        xscroll.pack(fill=tk.X)
+    def build_tarature_tab(self, parent):
+        header = ttk.Label(
+            parent,
+            text="Tarature calcolo cameriere",
+            font=("Segoe UI", 14, "bold"),
+        )
+        header.pack(anchor=tk.W, pady=(0, 10))
 
-    def param_row(self, parent, label, var, info_key):
+        general = ttk.LabelFrame(parent, text="Dati report", padding=10)
+        general.pack(fill=tk.X, pady=(0, 12))
+
+        row1 = ttk.Frame(general)
+        row1.pack(fill=tk.X, pady=4)
+        ttk.Label(row1, text="Hotel:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=self.var_hotel, width=40).pack(side=tk.LEFT, padx=6)
+
+        row2 = ttk.Frame(general)
+        row2.pack(fill=tk.X, pady=4)
+        ttk.Label(row2, text="Receptionist:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(row2, textvariable=self.var_receptionist, width=40).pack(side=tk.LEFT, padx=6)
+        ttk.Label(row2, text="Questo nome verra' stampato nel PDF.", foreground="gray").pack(side=tk.LEFT, padx=8)
+
+        params = ttk.LabelFrame(parent, text="Parametri di calcolo", padding=10)
+        params.pack(fill=tk.X)
+
+        self.param_row(params, "Stayover (min)", self.var_stay, "stayover", 0, 1000)
+        self.param_row(params, "Departure (min)", self.var_dep, "departure", 0, 1000)
+        self.param_row(params, "Arrival (min)", self.var_arr, "arrival", 0, 1000)
+        self.param_row(params, "Turno reali (min)", self.var_shift, "shift", 60, 1000)
+        self.param_row(params, "Efficienza (%)", self.var_eff, "eff", 10, 150)
+
+        buttons = ttk.Frame(parent)
+        buttons.pack(fill=tk.X, pady=12)
+        ttk.Button(buttons, text="Salva impostazioni", command=self.save).pack(side=tk.LEFT)
+
+        note = ttk.Label(
+            parent,
+            text=(
+                "Formula: Stayover = Rooms Morning - Departures. "
+                "Workload = Stayover x min stayover + Departures x min departure + Arrivals x min arrival. "
+                "Cameriere = CEIL(Workload / (Turno x Efficienza%)). "
+                "La colonna workload/ore resta nascosta."
+            ),
+            wraplength=850,
+            foreground="gray",
+        )
+        note.pack(anchor=tk.W, pady=(8, 0))
+
+    def param_row(self, parent, label, var, info_key, from_, to_):
         f = ttk.Frame(parent)
-        f.pack(fill=tk.X, pady=4)
+        f.pack(fill=tk.X, pady=5)
 
-        ttk.Label(f, text=label).pack(side=tk.LEFT)
-
-        ttk.Spinbox(f, from_=0, to=1000, textvariable=var, width=6).pack(side=tk.RIGHT)
-
+        ttk.Label(f, text=label, width=22).pack(side=tk.LEFT)
+        ttk.Spinbox(f, from_=from_, to=to_, textvariable=var, width=8).pack(side=tk.LEFT, padx=6)
         ttk.Button(
             f,
             text="(i)",
             width=4,
-            command=lambda k=info_key: self.show_info(k)
-        ).pack(side=tk.RIGHT, padx=(6, 6))
+            command=lambda k=info_key: self.show_info(k),
+        ).pack(side=tk.LEFT, padx=4)
 
     def show_info(self, key):
         txt = INFO_TEXT.get(key, "Nessuna descrizione disponibile.")
-        # Use a Toplevel popup for rich multi-line text
         win = tk.Toplevel(self)
         win.title("Info parametro")
         win.geometry("520x420")
@@ -315,14 +382,16 @@ class App(tk.Tk):
         btns.pack(fill=tk.X, pady=(8, 0))
         ttk.Button(btns, text="Chiudi", command=win.destroy).pack(side=tk.RIGHT)
 
+    # ---------- SETTINGS ----------
     def current_settings(self):
         return Settings(
             hotel_name=self.var_hotel.get(),
-            minutes_stayover=int(self.var_stay.get()),
-            minutes_departure=int(self.var_dep.get()),
-            minutes_arrival=int(self.var_arr.get()),
-            shift_minutes=int(self.var_shift.get()),
-            efficiency_percent=int(self.var_eff.get()),
+            receptionist_name=self.var_receptionist.get(),
+            minutes_stayover=parse_int(self.var_stay.get(), 20),
+            minutes_departure=parse_int(self.var_dep.get(), 40),
+            minutes_arrival=parse_int(self.var_arr.get(), 10),
+            shift_minutes=parse_int(self.var_shift.get(), 420),
+            efficiency_percent=parse_int(self.var_eff.get(), 85),
         ).clamp()
 
     def save(self):
@@ -333,43 +402,236 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Errore", str(e))
 
+    # ---------- REPORT ----------
     def load_xml(self):
         path = filedialog.askopenfilename(
             title="Seleziona file XML",
-            filetypes=[("XML", "*.xml *.XML"), ("Tutti i file", "*.*")]
+            filetypes=[("XML", "*.xml *.XML"), ("Tutti i file", "*.*")],
         )
         if not path:
             return
         self.xml_path = path
         self.lbl_xml.config(text=os.path.basename(path), foreground="black")
+        self.rows = []
+        self.clear_tree()
+        self.lbl_summary.config(text="XML caricato. Clicca Calcola per aggiornare i risultati.")
+
+    def clear_tree(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
 
     def calculate(self):
         if not self.xml_path:
             messagebox.showwarning("Attenzione", "Carica prima un file XML.")
             return
 
-        self.settings = self.current_settings()
-        base = extract_rows(self.xml_path)
+        try:
+            self.settings = self.current_settings()
+            base = extract_rows(self.xml_path)
+        except Exception as e:
+            messagebox.showerror("Errore lettura XML", str(e))
+            return
 
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-
+        self.clear_tree()
         self.rows = []
+
+        total_arrivals = 0
+        total_departures = 0
+        total_stayover = 0
+        total_staff = 0
+
         for r in base:
-            w, staff = compute(r, self.settings)
-            self.rows.append((r, w, staff))
+            workload, staff = compute(r, self.settings)
+            self.rows.append((r, workload, staff))
+
+            total_arrivals += r["arrivals"]
+            total_departures += r["departures"]
+            total_stayover += r["stayover"]
+            total_staff += staff
+
             self.tree.insert("", tk.END, values=(
                 r["date"],
                 r["day"],
                 r["arrivals"],
                 r["departures"],
                 r["stayover"],
-                w,
-                staff
+                staff,
             ))
 
+        self.lbl_summary.config(
+            text=(
+                f"Righe: {len(self.rows)} | "
+                f"Arrivi totali: {total_arrivals} | "
+                f"Partenze totali: {total_departures} | "
+                f"Stayover totali: {total_stayover} | "
+                f"Cameriere totali: {total_staff}"
+            )
+        )
+
+    def generate_pdf(self):
+        if not self.rows:
+            messagebox.showwarning("Attenzione", "Calcola prima i risultati, poi genera il PDF.")
+            return
+
+        self.settings = self.current_settings()
+        receptionist = self.settings.receptionist_name.strip()
+        if not receptionist:
+            messagebox.showwarning(
+                "Receptionist mancante",
+                "Inserisci il nome del receptionist nella tab Tarature prima di generare il PDF.",
+            )
+            self.notebook.select(self.tab_tarature)
+            return
+
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.lib.units import cm
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        except ImportError:
+            messagebox.showerror(
+                "Modulo mancante",
+                "Per generare il PDF installa ReportLab:\n\npip install reportlab",
+            )
+            return
+
+        now = datetime.now()
+        timestamp = now.strftime("%d/%m/%Y %H:%M:%S")
+        default_name = f"housekeeping_cameriere_{now.strftime('%Y%m%d_%H%M')}.pdf"
+
+        pdf_path = filedialog.asksaveasfilename(
+            title="Salva PDF",
+            defaultextension=".pdf",
+            initialfile=default_name,
+            filetypes=[("PDF", "*.pdf")],
+        )
+        if not pdf_path:
+            return
+
+        try:
+            page_size = landscape(A4)
+            doc = SimpleDocTemplate(
+                pdf_path,
+                pagesize=page_size,
+                leftMargin=1.0 * cm,
+                rightMargin=1.0 * cm,
+                topMargin=1.0 * cm,
+                bottomMargin=1.0 * cm,
+            )
+
+            styles = getSampleStyleSheet()
+            story = []
+
+            story.append(Paragraph("Housekeeping - Numero Cameriere Necessarie", styles["Title"]))
+            story.append(Spacer(1, 8))
+
+            meta_data = [
+                ["Hotel", escape(self.settings.hotel_name)],
+                ["Generato da", escape(receptionist)],
+                ["Data e ora generazione", timestamp],
+                ["File XML", escape(os.path.basename(self.xml_path or ""))],
+                [
+                    "Tarature",
+                    (
+                        f"Stayover {self.settings.minutes_stayover} min | "
+                        f"Departure {self.settings.minutes_departure} min | "
+                        f"Arrival {self.settings.minutes_arrival} min | "
+                        f"Turno {self.settings.shift_minutes} min | "
+                        f"Efficienza {self.settings.efficiency_percent}%"
+                    ),
+                ],
+            ]
+            meta = Table(meta_data, colWidths=[5 * cm, 22 * cm])
+            meta.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eeeeee")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ]))
+            story.append(meta)
+            story.append(Spacer(1, 12))
+
+            # Tabella senza colonna ore/minuti/workload.
+            table_data = [["Data", "Giorno", "Arrivi", "Partenze", "Stayover", "Cameriere"]]
+
+            total_arrivals = 0
+            total_departures = 0
+            total_stayover = 0
+            total_staff = 0
+
+            for r, _workload, staff in self.rows:
+                total_arrivals += r["arrivals"]
+                total_departures += r["departures"]
+                total_stayover += r["stayover"]
+                total_staff += staff
+
+                table_data.append([
+                    r["date"],
+                    r["day"],
+                    r["arrivals"],
+                    r["departures"],
+                    r["stayover"],
+                    staff,
+                ])
+
+            table_data.append([
+                "Totale",
+                "",
+                total_arrivals,
+                total_departures,
+                total_stayover,
+                total_staff,
+            ])
+
+            result_table = Table(
+                table_data,
+                colWidths=[3.0 * cm, 5.0 * cm, 3.0 * cm, 3.2 * cm, 3.2 * cm, 3.4 * cm],
+                repeatRows=1,
+            )
+            result_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 7),
+                ("TOPPADDING", (0, 0), (-1, 0), 7),
+                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#eeeeee")),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ]))
+            story.append(result_table)
+            story.append(Spacer(1, 12))
+
+            formula = (
+                "Formula usata: Stayover = max(0, Rooms Morning - Partenze). "
+                "Cameriere = CEIL((Stayover x min stayover + Partenze x min departure + Arrivi x min arrival) "
+                "/ (Turno minuti x Efficienza / 100)). "
+                "La colonna dei minuti/ore di lavoro e' calcolata internamente ma nascosta nel report."
+            )
+            story.append(Paragraph(escape(formula), styles["BodyText"]))
+
+            def add_footer(canvas, _doc):
+                canvas.saveState()
+                canvas.setFont("Helvetica", 8)
+                width, _height = page_size
+                canvas.drawRightString(width - 1.0 * cm, 0.55 * cm, f"Pagina {_doc.page}")
+                canvas.drawString(1.0 * cm, 0.55 * cm, f"Generato: {timestamp} - Receptionist: {receptionist}")
+                canvas.restoreState()
+
+            doc.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
+
+            messagebox.showinfo("PDF creato", f"PDF generato correttamente:\n{pdf_path}")
+
+        except Exception as e:
+            messagebox.showerror("Errore PDF", str(e))
+
     def on_close(self):
-        # Auto-save without popup
+        # Auto-save senza popup
         try:
             self.settings = self.current_settings()
             save_settings(self.settings)
